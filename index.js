@@ -2,6 +2,7 @@ const express = require('express');
 const path = require('path');
 const request = require('request');
 const redis = require('redis');
+const { NodeVM } = require('vm2');
 
 const app = express();
 const redisClient = redis.createClient(process.env.REDIS_URL);
@@ -23,6 +24,21 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, '/docs')));
 
+function run(code, args = []) {
+  const vm = new NodeVM({
+    // wrapper: 'none',
+    require: {
+      // builtin: ['*'],
+    },
+  });
+
+  const vmCode = `module.exports = ${code}`;
+  console.log(`VM Code: ${vmCode}`);
+  const functionWithCallbackInSandbox = vm.run(vmCode, 'vm.js');
+  const result = functionWithCallbackInSandbox(...args);
+  console.log(`Code Ran, result: ${result}`);
+}
+
 function track(slackTeam, slackChannel, slackUser) {
   const options = {
     method: 'POST',
@@ -37,41 +53,6 @@ function track(slackTeam, slackChannel, slackUser) {
 
   // request(options, () => {});
 }
-
-// app.post('/slack', (req, res) => {
-//   if (req.body.token !== process.env.SLACK_VERIFY_TOKEN) {
-//     return res.sendStatus(400);
-//   }
-
-//   let phrase = req.body.text;
-//   let emoji;
-
-//   if (!phrase || phrase === 'help') {
-//     track();
-//     return res.send({
-//       response_type: 'ephemeral',
-//       text: 'How to use /clap',
-//       attachments: [{
-//         text: "To add some claps to your life, use `/clap phrase`\nIf you want to clap without a clap, change it up with `/clap phrase emoji`\nWhichever emoji you put at the end, that's what you'll clap with!",
-//       }],
-//     });
-//   }
-
-//   const regex = /^(.*?)(:\S*?:)$/g;
-//   const match = regex.exec(phrase);
-
-//   if (match) {
-//     phrase = match[1];
-//     emoji = match[2];
-//   }
-
-//   track(phrase, emoji, req.body.team_domain, req.body.channel_name, req.body.user_name);
-
-//   return res.send({
-//     response_type: 'in_channel',
-//     text: clapPhrase(phrase, emoji),
-//   });
-// });
 
 app.post('/slack/create', (req, res) => {
   if (req.body.token !== process.env.SLACK_VERIFY_TOKEN) {
@@ -113,7 +94,12 @@ app.post('/slack/create', (req, res) => {
             label: 'JavaScript',
             name: 'code',
             type: 'textarea',
-            hint: 'Enter the code that you want to save',
+            hint: 'Enter the function that you want to save',
+          }, {
+            label: 'Arguments',
+            name: 'args',
+            type: 'text',
+            hint: 'Arguments to test your function, comma separated',
           }],
         },
       },
@@ -128,6 +114,37 @@ app.post('/slack/create', (req, res) => {
 
   track(req.body.team_domain, req.body.channel_name, req.body.user_name);
 });
+
+function handleCreateSnippet(req, codeKey) {
+  redisClient.exists(codeKey, (err, reply) => {
+    if (reply === 1) {
+      console.log(`${codeKey} exists`);
+      return {
+        errors: [{
+          name: 'name',
+          error: 'Name is already in use!',
+        }],
+      };
+    }
+
+    console.log(`${codeKey} doesn't exist`);
+
+    try {
+      run(req.body.submission.code, req.body.submission.args.split(','));
+    } catch (error) {
+      console.error(error);
+      return {
+        errors: [{
+          name: 'code',
+          error: `Error: ${error}`,
+        }],
+      };
+    }
+    redisClient.hmset(codeKey, req.body.submission, (err, reply) => {
+      return 'OK';
+    });
+  });
+}
 
 app.post('/slack/interactive', (req, res) => {
   req.body = JSON.parse(req.body.payload);
@@ -144,22 +161,9 @@ app.post('/slack/interactive', (req, res) => {
   }
   codeKey = `${codeKey}.${req.body.submission.name}`;
 
-  redisClient.exists(codeKey, (err, reply) => {
-    if (reply === 1) {
-      console.log(`${codeKey} exists`);
-      return res.send({
-        errors: [{
-          name: 'name',
-          error: 'Name is already in use!',
-        }],
-      });
-    }
-    console.log(`${codeKey} doesn't exist`);
-    redisClient.hmset(codeKey, req.body.submission, (err, reply) => {
-      console.log(`Reply: ${reply}`);
-      res.sendStatus(200);
-    });
-  });
+  if (req.body.callback_id === 'create') {
+    res.send(handleCreateSnippet(req, codeKey));
+  }
 });
 
 app.get('/slack/redirect', (req, res) => {
